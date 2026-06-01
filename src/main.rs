@@ -21,7 +21,7 @@ const CUSTOM_ANSWER_OPTION: &str = "Write your own";
 )]
 struct Args {
     /// Natural-language command request.
-    #[arg(required = true, trailing_var_arg = true)]
+    #[arg(trailing_var_arg = true)]
     prompt: Vec<String>,
 
     /// Print the command only, without explanations or selection UI.
@@ -31,6 +31,10 @@ struct Args {
     /// Dump AI request and response details to stderr.
     #[arg(long)]
     debug: bool,
+
+    /// Print recent history prompts for shell completions.
+    #[arg(long, hide = true)]
+    history_completions: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +104,16 @@ fn default_base_url() -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.history_completions {
+        let history = HistoryDb::open()?;
+        history.print_completion_prompts()?;
+        return Ok(());
+    }
+
+    if args.prompt.is_empty() {
+        bail!("missing prompt");
+    }
+
     let config = Config::load()?;
     let history = HistoryDb::open()?;
     let client = LlmClient::new(config, history, args.debug)?;
@@ -352,6 +366,39 @@ ON CONFLICT(model, system_prompt, user_prompt) DO UPDATE SET
         )?;
         Ok(())
     }
+
+    fn print_completion_prompts(&self) -> Result<()> {
+        for prompt in self.completion_prompts()? {
+            println!("{prompt}");
+        }
+
+        Ok(())
+    }
+
+    fn completion_prompts(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            r#"
+SELECT user_prompt
+FROM llm_exchanges
+GROUP BY user_prompt
+ORDER BY MAX(last_used_at) DESC, MAX(id) DESC
+LIMIT 50
+"#,
+        )?;
+
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut prompts = Vec::new();
+        for row in rows {
+            let prompt = row?;
+            if let Some(first_line) = prompt.lines().next()
+                && !first_line.trim().is_empty()
+            {
+                prompts.push(first_line.to_string());
+            }
+        }
+
+        Ok(prompts)
+    }
 }
 
 impl Config {
@@ -468,6 +515,7 @@ Rules:
 - The command must be a single command line for the user's shell.
 - Prefer safe commands and include dry-run variants where practical.
 - Do not use destructive flags unless the user explicitly asks for them.
+- Always add flags to print progress when working with normally-silent tools.
 - Ask a clarification question if required paths, targets, or intent are missing."#,
         shell = context.shell,
         os = context.os,
@@ -733,6 +781,43 @@ model = "gpt-4.1-mini"
                 options: vec!["main".to_string(), "current".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn history_completion_prompts_are_newest_first_unique_first_lines() {
+        let path = temp_history_path("completion-prompts");
+        let _ = fs::remove_file(&path);
+        let history = HistoryDb::open_at(path.clone()).unwrap();
+        let response = test_response(
+            r#"{"type":"command","command":"ls","explanation":"Lists files.","dry_runs":[]}"#,
+        );
+
+        history
+            .store(
+                "model",
+                "system",
+                "list files",
+                &test_request("list files"),
+                &response,
+            )
+            .unwrap();
+        history
+            .store(
+                "model",
+                "system",
+                "remove cache\nClarification: Which cache?\nAnswer: npm",
+                &test_request("remove cache"),
+                &response,
+            )
+            .unwrap();
+
+        let prompts = history.completion_prompts().unwrap();
+        assert_eq!(
+            prompts,
+            vec!["remove cache".to_string(), "list files".to_string()]
+        );
+
+        fs::remove_file(path).unwrap();
     }
 
     fn temp_history_path(name: &str) -> PathBuf {

@@ -1,6 +1,6 @@
 # Maintainer: ripdog
 pkgname=ai-shell
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc='AI command generator shell helper'
 arch=('x86_64')
