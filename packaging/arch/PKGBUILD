@@ -1,0 +1,30 @@
+# Maintainer: ripdog
+pkgname=ai-shell
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='AI command generator shell helper'
+arch=('x86_64')
+license=('custom')
+makedepends=('cargo')
+depends=('gcc-libs')
+options=('!lto')
+source=()
+sha256sums=()
+
+_repo_root="$startdir/../.."
+
+build() {
+  cd "$_repo_root"
+  CARGO_TARGET_DIR="$srcdir/cargo-target" cargo build --release --locked
+}
+
+check() {
+  cd "$_repo_root"
+  CARGO_TARGET_DIR="$srcdir/cargo-target" cargo test --locked
+}
+
+package() {
+  cd "$_repo_root"
+  install -Dm755 "$srcdir/cargo-target/release/ai" "$pkgdir/usr/bin/ai"
+  install -Dm644 completions/ai.fish "$pkgdir/usr/share/fish/vendor_completions.d/ai.fish"
+}
