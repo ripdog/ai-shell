@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use inquire::{Select, Text};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 const CUSTOM_ANSWER_OPTION: &str = "Write your own";
@@ -88,6 +89,10 @@ struct ChatChoice {
     message: ChatMessage,
 }
 
+struct HistoryDb {
+    connection: Connection,
+}
+
 fn default_base_url() -> String {
     "https://api.openai.com/v1".to_string()
 }
@@ -96,7 +101,8 @@ fn default_base_url() -> String {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let config = Config::load()?;
-    let client = LlmClient::new(config, args.debug)?;
+    let history = HistoryDb::open()?;
+    let client = LlmClient::new(config, history, args.debug)?;
     let shell_context = ShellContext::detect()?;
     let mut user_prompt = args.prompt.join(" ");
 
@@ -134,11 +140,12 @@ async fn main() -> Result<()> {
 struct LlmClient {
     http: reqwest::Client,
     config: Config,
+    history: HistoryDb,
     debug: bool,
 }
 
 impl LlmClient {
-    fn new(config: Config, debug: bool) -> Result<Self> {
+    fn new(config: Config, history: HistoryDb, debug: bool) -> Result<Self> {
         let mut headers = HeaderMap::new();
         let auth_value = format!("Bearer {}", config.api_key);
         headers.insert(
@@ -155,18 +162,20 @@ impl LlmClient {
         Ok(Self {
             http,
             config,
+            history,
             debug,
         })
     }
 
     async fn plan_command(&self, context: &ShellContext, prompt: &str) -> Result<ModelPlan> {
+        let system = system_prompt(context);
         let request = ChatRequest {
             model: self.config.model.clone(),
             temperature: self.config.temperature,
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: system_prompt(context),
+                    content: system.clone(),
                 },
                 ChatMessage {
                     role: "user".to_string(),
@@ -174,6 +183,11 @@ impl LlmClient {
                 },
             ],
         };
+
+        if let Some(response) = self.history.lookup(&self.config.model, &system, prompt)? {
+            self.debug_cache_hit(&request, &response)?;
+            return plan_from_response(&response);
+        }
 
         self.debug_request(&request)?;
 
@@ -195,14 +209,10 @@ impl LlmClient {
             .context("failed to parse LLM API response")?;
 
         self.debug_response(&response)?;
+        self.history
+            .store(&self.config.model, &system, prompt, &request, &response)?;
 
-        let content = response
-            .choices
-            .first()
-            .map(|choice| choice.message.content.trim())
-            .ok_or_else(|| anyhow!("LLM API response did not include any choices"))?;
-
-        parse_model_plan(content)
+        plan_from_response(&response)
     }
 
     fn debug_request(&self, request: &ChatRequest) -> Result<()> {
@@ -218,6 +228,128 @@ impl LlmClient {
             eprintln!("--- ai-shell debug: response ---");
             eprintln!("{}", serde_json::to_string_pretty(response)?);
         }
+        Ok(())
+    }
+
+    fn debug_cache_hit(&self, request: &ChatRequest, response: &ChatResponse) -> Result<()> {
+        if self.debug {
+            eprintln!("--- ai-shell debug: cache hit ---");
+            eprintln!("request:");
+            eprintln!("{}", serde_json::to_string_pretty(request)?);
+            eprintln!("cached response:");
+            eprintln!("{}", serde_json::to_string_pretty(response)?);
+        }
+        Ok(())
+    }
+}
+
+impl HistoryDb {
+    fn open() -> Result<Self> {
+        Self::open_at(history_path()?)
+    }
+
+    fn open_at(path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create history directory {}", parent.display())
+            })?;
+        }
+
+        let connection = Connection::open(&path)
+            .with_context(|| format!("failed to open history database {}", path.display()))?;
+        let db = Self { connection };
+        db.migrate()?;
+        Ok(db)
+    }
+
+    fn migrate(&self) -> Result<()> {
+        self.connection.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS llm_exchanges (
+    id INTEGER PRIMARY KEY,
+    model TEXT NOT NULL,
+    system_prompt TEXT NOT NULL,
+    user_prompt TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(model, system_prompt, user_prompt)
+);
+"#,
+        )?;
+        Ok(())
+    }
+
+    fn lookup(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<Option<ChatResponse>> {
+        let response_json = self
+            .connection
+            .query_row(
+                r#"
+SELECT response_json
+FROM llm_exchanges
+WHERE model = ?1 AND system_prompt = ?2 AND user_prompt = ?3
+"#,
+                params![model, system_prompt, user_prompt],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        let Some(response_json) = response_json else {
+            return Ok(None);
+        };
+
+        self.connection.execute(
+            r#"
+UPDATE llm_exchanges
+SET last_used_at = CURRENT_TIMESTAMP,
+    use_count = use_count + 1
+WHERE model = ?1 AND system_prompt = ?2 AND user_prompt = ?3
+"#,
+            params![model, system_prompt, user_prompt],
+        )?;
+
+        serde_json::from_str(&response_json)
+            .context("cached LLM response was not valid response JSON")
+            .map(Some)
+    }
+
+    fn store(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        request: &ChatRequest,
+        response: &ChatResponse,
+    ) -> Result<()> {
+        self.connection.execute(
+            r#"
+INSERT INTO llm_exchanges (
+    model,
+    system_prompt,
+    user_prompt,
+    request_json,
+    response_json
+) VALUES (?1, ?2, ?3, ?4, ?5)
+ON CONFLICT(model, system_prompt, user_prompt) DO UPDATE SET
+    request_json = excluded.request_json,
+    response_json = excluded.response_json,
+    last_used_at = CURRENT_TIMESTAMP
+"#,
+            params![
+                model,
+                system_prompt,
+                user_prompt,
+                serde_json::to_string(request)?,
+                serde_json::to_string(response)?,
+            ],
+        )?;
         Ok(())
     }
 }
@@ -256,6 +388,15 @@ fn config_path() -> Result<PathBuf> {
 
     let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
     Ok(Path::new(&home).join(".config/ai-shell/config.toml"))
+}
+
+fn history_path() -> Result<PathBuf> {
+    if let Some(data_home) = env::var_os("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(data_home).join("ai-shell/history.sqlite"));
+    }
+
+    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    Ok(Path::new(&home).join(".local/share/ai-shell/history.sqlite"))
 }
 
 fn write_config_template(path: &Path) -> Result<()> {
@@ -347,6 +488,16 @@ fn parse_model_plan(content: &str) -> Result<ModelPlan> {
         .trim();
 
     serde_json::from_str(json).context("model response was not valid plan JSON")
+}
+
+fn plan_from_response(response: &ChatResponse) -> Result<ModelPlan> {
+    let content = response
+        .choices
+        .first()
+        .map(|choice| choice.message.content.trim())
+        .ok_or_else(|| anyhow!("LLM API response did not include any choices"))?;
+
+    parse_model_plan(content)
 }
 
 fn present_command(command: &str, explanation: &str, dry_runs: &[String]) {
@@ -531,5 +682,88 @@ model = "gpt-4.1-mini"
         assert!(raw.contains("model = \"gpt-4.1-mini\""));
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stores_and_replays_history_response() {
+        let path = temp_history_path("stores-and-replays");
+        let _ = fs::remove_file(&path);
+        let history = HistoryDb::open_at(path.clone()).unwrap();
+        let request = test_request("show files");
+        let response = test_response(
+            r#"{"type":"command","command":"ls","explanation":"Lists files.","dry_runs":[]}"#,
+        );
+
+        assert!(
+            history
+                .lookup("model", "system", "show files")
+                .unwrap()
+                .is_none()
+        );
+        history
+            .store("model", "system", "show files", &request, &response)
+            .unwrap();
+
+        let cached = history
+            .lookup("model", "system", "show files")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan_from_response(&cached).unwrap(),
+            ModelPlan::Command {
+                command: "ls".to_string(),
+                explanation: "Lists files.".to_string(),
+                dry_runs: Vec::new(),
+            }
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cached_clarification_response_replays_as_question() {
+        let response = test_response(
+            r#"{"type":"clarification","question":"Which branch?","options":["main","current"]}"#,
+        );
+
+        assert_eq!(
+            plan_from_response(&response).unwrap(),
+            ModelPlan::Clarification {
+                question: "Which branch?".to_string(),
+                options: vec!["main".to_string(), "current".to_string()],
+            }
+        );
+    }
+
+    fn temp_history_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!("ai-shell-{name}-{}.sqlite", std::process::id()))
+    }
+
+    fn test_request(prompt: &str) -> ChatRequest {
+        ChatRequest {
+            model: "model".to_string(),
+            temperature: None,
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: "system".to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: prompt.to_string(),
+                },
+            ],
+        }
+    }
+
+    fn test_response(content: &str) -> ChatResponse {
+        ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: content.to_string(),
+                },
+            }],
+        }
     }
 }
