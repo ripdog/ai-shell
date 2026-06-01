@@ -594,17 +594,10 @@ fn handle_command_session(
 ) -> Result<Option<String>> {
     present_command(command, explanation, dry_runs);
 
-    let action = Select::new(
-        "What would you like to do?",
-        vec![
-            CommandAction::Run,
-            CommandAction::Edit,
-            CommandAction::RequestRevision,
-        ],
-    )
-    .with_help_message("Use arrow keys and Enter to choose")
-    .prompt()
-    .context("failed to read command action")?;
+    let action = Select::new("What would you like to do?", command_actions(dry_runs))
+        .with_help_message("Use arrow keys and Enter to choose")
+        .prompt()
+        .context("failed to read command action")?;
 
     match action {
         CommandAction::Run => {
@@ -619,6 +612,14 @@ fn handle_command_session(
             run_shell_command(&edited)?;
             Ok(None)
         }
+        CommandAction::RunDryRun => {
+            let dry_run = Select::new("Which dry-run command?", dry_runs.to_vec())
+                .with_help_message("Use arrow keys and Enter to choose")
+                .prompt()
+                .context("failed to read dry-run selection")?;
+            run_shell_command(&dry_run)?;
+            Ok(None)
+        }
         CommandAction::RequestRevision => {
             let revision = Text::new("What should change?")
                 .prompt()
@@ -628,10 +629,11 @@ fn handle_command_session(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum CommandAction {
     Run,
     Edit,
+    RunDryRun,
     RequestRevision,
 }
 
@@ -640,9 +642,19 @@ impl std::fmt::Display for CommandAction {
         match self {
             Self::Run => write!(formatter, "Run"),
             Self::Edit => write!(formatter, "Edit"),
+            Self::RunDryRun => write!(formatter, "Run Dry-Run"),
             Self::RequestRevision => write!(formatter, "Request Revision"),
         }
     }
+}
+
+fn command_actions(dry_runs: &[String]) -> Vec<CommandAction> {
+    let mut actions = vec![CommandAction::Run, CommandAction::Edit];
+    if !dry_runs.is_empty() {
+        actions.push(CommandAction::RunDryRun);
+    }
+    actions.push(CommandAction::RequestRevision);
+    actions
 }
 
 fn run_shell_command(command: &str) -> Result<()> {
@@ -818,6 +830,28 @@ model = "gpt-4.1-mini"
         );
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dry_run_action_only_appears_when_available() {
+        assert_eq!(
+            command_actions(&[]),
+            vec![
+                CommandAction::Run,
+                CommandAction::Edit,
+                CommandAction::RequestRevision,
+            ]
+        );
+
+        assert_eq!(
+            command_actions(&["ls --dry-run".to_string()]),
+            vec![
+                CommandAction::Run,
+                CommandAction::Edit,
+                CommandAction::RunDryRun,
+                CommandAction::RequestRevision,
+            ]
+        );
     }
 
     fn temp_history_path(name: &str) -> PathBuf {
