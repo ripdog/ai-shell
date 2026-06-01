@@ -6,9 +6,11 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use inquire::Select;
+use inquire::{Select, Text};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+
+const CUSTOM_ANSWER_OPTION: &str = "Write your own";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -110,17 +112,17 @@ async fn main() -> Result<()> {
                     println!("{command}");
                     return Ok(());
                 }
-                present_command(&command, &explanation, &dry_runs);
+                let revision = handle_command_session(&command, &explanation, &dry_runs)?;
+                if let Some(revision) = revision {
+                    user_prompt = format!(
+                        "{user_prompt}\nPrevious command: {command}\nRevision request: {revision}"
+                    );
+                    continue;
+                }
                 return Ok(());
             }
             ModelPlan::Clarification { question, options } => {
-                if options.is_empty() {
-                    bail!("model asked for clarification without providing options");
-                }
-                let answer = Select::new(&question, options)
-                    .with_help_message("Use arrow keys and Enter to choose")
-                    .prompt()
-                    .context("failed to read clarification response")?;
+                let answer = ask_free_form_question(&question, &options)?;
                 user_prompt = format!("{user_prompt}\nClarification: {question}\nAnswer: {answer}");
             }
         }
@@ -359,37 +361,104 @@ fn present_command(command: &str, explanation: &str, dry_runs: &[String]) {
             println!("- {dry_run}");
         }
     }
+}
 
-    if let Some(copy_command) = clipboard_command(command) {
-        println!();
-        println!("Copy command:");
-        println!("{copy_command}");
+fn ask_free_form_question(question: &str, options: &[String]) -> Result<String> {
+    let mut choices = options.to_vec();
+    choices.push(CUSTOM_ANSWER_OPTION.to_string());
+
+    let selected = Select::new(question, choices)
+        .with_help_message("Use arrow keys and Enter to choose")
+        .prompt()
+        .context("failed to read clarification response")?;
+
+    let answer = if selected == CUSTOM_ANSWER_OPTION {
+        Text::new("Your answer:")
+            .prompt()
+            .context("failed to read custom clarification response")?
+    } else {
+        selected
+    };
+
+    let answer = answer.trim();
+    if answer.is_empty() {
+        bail!("clarification answer cannot be empty");
+    }
+
+    Ok(answer.to_string())
+}
+
+fn handle_command_session(
+    command: &str,
+    explanation: &str,
+    dry_runs: &[String],
+) -> Result<Option<String>> {
+    present_command(command, explanation, dry_runs);
+
+    let action = Select::new(
+        "What would you like to do?",
+        vec![
+            CommandAction::Run,
+            CommandAction::Edit,
+            CommandAction::RequestRevision,
+        ],
+    )
+    .with_help_message("Use arrow keys and Enter to choose")
+    .prompt()
+    .context("failed to read command action")?;
+
+    match action {
+        CommandAction::Run => {
+            run_shell_command(command)?;
+            Ok(None)
+        }
+        CommandAction::Edit => {
+            let edited = Text::new("Edit command:")
+                .with_initial_value(command)
+                .prompt()
+                .context("failed to read edited command")?;
+            run_shell_command(&edited)?;
+            Ok(None)
+        }
+        CommandAction::RequestRevision => {
+            let revision = Text::new("What should change?")
+                .prompt()
+                .context("failed to read revision request")?;
+            Ok(Some(revision))
+        }
     }
 }
 
-fn clipboard_command(command: &str) -> Option<String> {
-    let escaped = command.replace('\'', "'\\''");
-    if command_exists("pbcopy") {
-        return Some(format!("printf '%s' '{escaped}' | pbcopy"));
-    }
-    if command_exists("wl-copy") {
-        return Some(format!("printf '%s' '{escaped}' | wl-copy"));
-    }
-    if command_exists("xclip") {
-        return Some(format!(
-            "printf '%s' '{escaped}' | xclip -selection clipboard"
-        ));
-    }
-    None
+#[derive(Clone, Copy)]
+enum CommandAction {
+    Run,
+    Edit,
+    RequestRevision,
 }
 
-fn command_exists(name: &str) -> bool {
-    Command::new("sh")
+impl std::fmt::Display for CommandAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Run => write!(formatter, "Run"),
+            Self::Edit => write!(formatter, "Edit"),
+            Self::RequestRevision => write!(formatter, "Request Revision"),
+        }
+    }
+}
+
+fn run_shell_command(command: &str) -> Result<()> {
+    let shell = current_shell();
+    let status = Command::new(shell)
         .arg("-c")
-        .arg(format!("command -v {name} >/dev/null 2>&1"))
+        .arg(command)
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .with_context(|| format!("failed to run command: {command}"))?;
+
+    if !status.success() {
+        bail!("command exited with status {status}");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
