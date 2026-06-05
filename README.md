@@ -60,13 +60,13 @@ temperature = 0.2
 ai list the largest files under this directory
 ai --plain show listening TCP ports
 ai --debug remove old build artifacts
-ai --ls summarize this directory
-ai --ls --ls /var/log find large logs
+ai --ls -- summarize this directory
+ai --ls --ls /var/log -- find large logs
 ```
 
 Normal mode shows the generated command and explanation, then asks whether to run it, edit it first, or request a revision.
 
-Use `--ls` to attach `ls -la` output as extra model context. On its own it lists the current directory; with a path it lists that directory. The flag can be repeated.
+Use `--ls` to attach `ls -la` output as extra model context. On its own it lists the current directory; with a path it lists that directory. The flag can be repeated. When using bare `--ls`, add `--` before the prompt so the first prompt word is not parsed as a directory path.
 
 ## History
 
