@@ -32,6 +32,10 @@ struct Args {
     #[arg(long)]
     debug: bool,
 
+    /// Attach `ls -la` output for PATH as prompt context. Defaults to the current directory.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = ".")]
+    ls: Vec<PathBuf>,
+
     /// Print recent history prompts for shell completions.
     #[arg(long, hide = true)]
     history_completions: bool,
@@ -52,6 +56,13 @@ struct ShellContext {
     shell: String,
     os: String,
     cwd: PathBuf,
+    listings: Vec<DirectoryListing>,
+}
+
+#[derive(Debug)]
+struct DirectoryListing {
+    path: PathBuf,
+    output: String,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -117,7 +128,7 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
     let history = HistoryDb::open()?;
     let client = LlmClient::new(config, history, args.debug)?;
-    let shell_context = ShellContext::detect()?;
+    let shell_context = ShellContext::detect(&args.ls)?;
     let mut user_prompt = args.prompt.join(" ");
 
     for _ in 0..3 {
@@ -419,11 +430,12 @@ impl Config {
 }
 
 impl ShellContext {
-    fn detect() -> Result<Self> {
+    fn detect(listing_paths: &[PathBuf]) -> Result<Self> {
         Ok(Self {
             shell: current_shell(),
             os: os_context(),
             cwd: env::current_dir().context("failed to detect current directory")?,
+            listings: collect_directory_listings(listing_paths)?,
         })
     }
 }
@@ -485,8 +497,37 @@ fn os_context() -> String {
         .unwrap_or_else(|| env::consts::OS.to_string())
 }
 
+fn collect_directory_listings(paths: &[PathBuf]) -> Result<Vec<DirectoryListing>> {
+    paths
+        .iter()
+        .map(|path| {
+            if !path.is_dir() {
+                bail!("--ls path is not a directory: {}", path.display());
+            }
+
+            let output = Command::new("ls")
+                .arg("-la")
+                .arg(path)
+                .output()
+                .with_context(|| format!("failed to run ls -la {}", path.display()))?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("ls -la {} failed: {}", path.display(), stderr.trim());
+            }
+
+            Ok(DirectoryListing {
+                path: path.clone(),
+                output: String::from_utf8_lossy(&output.stdout)
+                    .trim_end()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
 fn system_prompt(context: &ShellContext) -> String {
-    format!(
+    let mut prompt = format!(
         r#"You generate shell commands for a user.
 
 Context:
@@ -520,7 +561,20 @@ Rules:
         shell = context.shell,
         os = context.os,
         cwd = context.cwd.display()
-    )
+    );
+
+    if !context.listings.is_empty() {
+        prompt.push_str("\n\nDirectory listings:");
+        for listing in &context.listings {
+            prompt.push_str(&format!(
+                "\n\n`ls -la {}`:\n```text\n{}\n```",
+                listing.path.display(),
+                listing.output
+            ));
+        }
+    }
+
+    prompt
 }
 
 fn parse_model_plan(content: &str) -> Result<ModelPlan> {
@@ -852,6 +906,35 @@ model = "gpt-4.1-mini"
                 CommandAction::RequestRevision,
             ]
         );
+    }
+
+    #[test]
+    fn system_prompt_includes_directory_listing_context() {
+        let context = ShellContext {
+            shell: "/bin/sh".to_string(),
+            os: "test-os".to_string(),
+            cwd: PathBuf::from("/tmp/example"),
+            listings: vec![DirectoryListing {
+                path: PathBuf::from("."),
+                output: "total 0\n-rw-r--r-- file.txt".to_string(),
+            }],
+        };
+
+        let prompt = system_prompt(&context);
+        assert!(prompt.contains("Directory listings:"));
+        assert!(prompt.contains("`ls -la .`:"));
+        assert!(prompt.contains("-rw-r--r-- file.txt"));
+    }
+
+    #[test]
+    fn directory_listing_errors_for_non_directory() {
+        let path = env::temp_dir().join(format!("ai-shell-file-{}", std::process::id()));
+        fs::write(&path, "not a directory").unwrap();
+
+        let error = collect_directory_listings(std::slice::from_ref(&path)).unwrap_err();
+        assert!(error.to_string().contains("--ls path is not a directory"));
+
+        fs::remove_file(path).unwrap();
     }
 
     fn temp_history_path(name: &str) -> PathBuf {
